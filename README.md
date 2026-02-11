@@ -24,11 +24,6 @@ pip install -r requirements.txt
 
 ## Запуск
 
-### Из exe:
-```bash
-.\dist\ModelAnalyzer.exe
-```
-
 ### Из исходников:
 ```bash
 python main.py
