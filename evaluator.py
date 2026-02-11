@@ -175,8 +175,13 @@ def _compute_tp_fp(
     total_preds = 0
     missing_labels = 0
     redirect = _LogRedirect(log_callback) if verbose_logs else None
-    stdout_ctx = contextlib.redirect_stdout(redirect) if redirect else contextlib.nullcontext()
-    stderr_ctx = contextlib.redirect_stderr(redirect) if redirect else contextlib.nullcontext()
+    
+    # Fix for PyInstaller: always provide redirect to avoid None stdout/stderr
+    if redirect is None:
+        redirect = _LogRedirect(None)
+    
+    stdout_ctx = contextlib.redirect_stdout(redirect)
+    stderr_ctx = contextlib.redirect_stderr(redirect)
     log_ctx = _attach_log_handler(log_callback) if verbose_logs else contextlib.nullcontext()
 
     predict_kwargs = {
@@ -329,14 +334,20 @@ class _LogRedirect:
         return cleaned
 
     def write(self, text):
-        if not text:
+        if not text or text is None:
             return
-        cleaned = self._sanitize(text)
-        if self._callback:
-            self._callback(cleaned)
+        try:
+            cleaned = self._sanitize(text)
+            if self._callback:
+                self._callback(cleaned)
+        except Exception:
+            pass
 
     def flush(self):
-        return None
+        pass
+    
+    def isatty(self):
+        return False
 
 
 @contextlib.contextmanager
@@ -424,8 +435,13 @@ def evaluate_model(
         log_callback("TP/FP settings: conf=0.25, iou=0.5\n")
 
     redirect = _LogRedirect(log_callback) if verbose_logs else None
-    stdout_ctx = contextlib.redirect_stdout(redirect) if redirect else contextlib.nullcontext()
-    stderr_ctx = contextlib.redirect_stderr(redirect) if redirect else contextlib.nullcontext()
+    
+    # Fix for PyInstaller: always provide redirect to avoid None stdout/stderr
+    if redirect is None:
+        redirect = _LogRedirect(None)
+    
+    stdout_ctx = contextlib.redirect_stdout(redirect)
+    stderr_ctx = contextlib.redirect_stderr(redirect)
 
     log_ctx = _attach_log_handler(log_callback) if verbose_logs else contextlib.nullcontext()
 
