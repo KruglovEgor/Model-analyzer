@@ -1,7 +1,20 @@
+import multiprocessing
 import os
 import sys
 import queue
 import threading
+
+# PyInstaller console=False sets sys.stdout/stderr to None.
+# Python's logging StreamHandler crashes writing to None.
+# Replace with devnull BEFORE any library imports.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
+# Prevent ultralytics from spawning subprocess to auto-install packages
+# (causes new windows in frozen exe).
+os.environ["YOLO_AUTOINSTALL"] = "false"
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -257,6 +270,7 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    multiprocessing.freeze_support()   # prevent ONNX/torch subprocess from spawning new windows
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
