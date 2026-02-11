@@ -1,159 +1,190 @@
 import os
+import sys
 import queue
 import threading
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QLineEdit, QPushButton, QTextEdit, QCheckBox, QProgressBar,
+    QFileDialog, QMessageBox, QGroupBox,
+)
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QFont, QTextCursor
 
 from evaluator import evaluate_model
 
+# (display label, dict key, decimal digits)
+_RESULT_FIELDS = (
+    ("Avg inference (ms/img)", "speed_ms", 2),
+    ("Precision",              "precision", 4),
+    ("Recall",                 "recall",    4),
+    ("mAP@0.5",               "map50",     4),
+    ("mAP@0.5:0.95",          "map50_95",  4),
+    ("True positives",         "tp",        0),
+    ("False positives",        "fp",        0),
+)
 
-class App(tk.Tk):
+MONO = QFont("Consolas", 10)
+
+
+class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.title("Model Analyzer")
-        self.geometry("780x560")
+        self.setWindowTitle("Model Analyzer")
+        self.resize(800, 600)
 
-        self.model_path = tk.StringVar()
-        self.data_path = tk.StringVar()
-        self.status_text = tk.StringVar(value="Idle")
-        self.verbose_logs = tk.BooleanVar(value=False)
-
-        self._queue = queue.Queue()
-        self._worker = None
+        self._queue: queue.Queue = queue.Queue()
+        self._worker: threading.Thread | None = None
 
         self._build_ui()
-        self._poll_queue()
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._poll_queue)
+        self._timer.start(100)
+
+    # ── UI ──────────────────────────────────────────────────────
 
     def _build_ui(self):
-        main = ttk.Frame(self, padding=12)
-        main.pack(fill=tk.BOTH, expand=True)
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
 
-        path_frame = ttk.LabelFrame(main, text="Inputs", padding=10)
-        path_frame.pack(fill=tk.X)
+        # --- Inputs ---
+        inp = QGroupBox("Inputs")
+        inp_lay = QVBoxLayout(inp)
 
-        ttk.Label(path_frame, text="Model (.pt/.onnx):").grid(row=0, column=0, sticky=tk.W)
-        ttk.Entry(path_frame, textvariable=self.model_path, width=64).grid(
-            row=0, column=1, padx=6, sticky=tk.W
-        )
-        ttk.Button(path_frame, text="Browse", command=self._pick_model).grid(row=0, column=2)
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Model (.pt / .onnx):"))
+        self.model_edit = QLineEdit()
+        row1.addWidget(self.model_edit, 1)
+        btn_model = QPushButton("Browse")
+        btn_model.clicked.connect(self._pick_model)
+        row1.addWidget(btn_model)
+        inp_lay.addLayout(row1)
 
-        ttk.Label(path_frame, text="Dataset (data.yaml):").grid(row=1, column=0, sticky=tk.W, pady=6)
-        ttk.Entry(path_frame, textvariable=self.data_path, width=64).grid(
-            row=1, column=1, padx=6, sticky=tk.W
-        )
-        ttk.Button(path_frame, text="Browse", command=self._pick_data).grid(row=1, column=2)
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Dataset (data.yaml):"))
+        self.data_edit = QLineEdit()
+        row2.addWidget(self.data_edit, 1)
+        btn_data = QPushButton("Browse")
+        btn_data.clicked.connect(self._pick_data)
+        row2.addWidget(btn_data)
+        inp_lay.addLayout(row2)
 
-        action_frame = ttk.Frame(main)
-        action_frame.pack(fill=tk.X, pady=(10, 0))
+        root.addWidget(inp)
 
-        self.run_btn = ttk.Button(action_frame, text="Run Evaluation", command=self._run)
-        self.run_btn.pack(side=tk.LEFT)
+        # --- Toolbar ---
+        toolbar = QHBoxLayout()
+        self.run_btn = QPushButton("Run Evaluation")
+        self.run_btn.clicked.connect(self._run)
+        toolbar.addWidget(self.run_btn)
 
-        ttk.Checkbutton(
-            action_frame,
-            text="Extra logs",
-            variable=self.verbose_logs,
-        ).pack(side=tk.LEFT, padx=(10, 0))
+        self.verbose_cb = QCheckBox("Extra logs")
+        toolbar.addWidget(self.verbose_cb)
 
-        self.progress = ttk.Progressbar(action_frame, mode="indeterminate")
-        self.progress.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)  # will toggle between busy / idle
+        self.progress.setRange(0, 1)  # idle state: no animation
+        self.progress.setValue(0)
+        toolbar.addWidget(self.progress, 1)
 
-        ttk.Label(action_frame, textvariable=self.status_text).pack(side=tk.RIGHT)
+        self.status_label = QLabel("Idle")
+        toolbar.addWidget(self.status_label)
 
-        results_frame = ttk.LabelFrame(main, text="Results", padding=10)
-        results_frame.pack(fill=tk.X, pady=(12, 0))
+        root.addLayout(toolbar)
 
-        self._result_vars = {
-            "speed_ms": tk.StringVar(value="-"),
-            "precision": tk.StringVar(value="-"),
-            "recall": tk.StringVar(value="-"),
-            "map50": tk.StringVar(value="-"),
-            "map50_95": tk.StringVar(value="-"),
-            "tp": tk.StringVar(value="-"),
-            "fp": tk.StringVar(value="-"),
-        }
+        # --- Results (fully selectable & copyable) ---
+        res = QGroupBox("Results")
+        res_lay = QVBoxLayout(res)
 
-        labels = [
-            ("Avg inference (ms/img)", "speed_ms"),
-            ("Precision", "precision"),
-            ("Recall", "recall"),
-            ("mAP@0.5", "map50"),
-            ("mAP@0.5:0.95", "map50_95"),
-            ("True positives", "tp"),
-            ("False positives", "fp"),
-        ]
+        res_toolbar = QHBoxLayout()
+        res_toolbar.addStretch()
+        btn_export = QPushButton("Export Results")
+        btn_export.clicked.connect(self._export_results)
+        res_toolbar.addWidget(btn_export)
+        res_lay.addLayout(res_toolbar)
 
-        for idx, (label, key) in enumerate(labels):
-            ttk.Label(results_frame, text=label + ":").grid(row=idx, column=0, sticky=tk.W, pady=2)
-            ttk.Label(results_frame, textvariable=self._result_vars[key]).grid(
-                row=idx, column=1, sticky=tk.W, pady=2
-            )
+        self.results_text = QTextEdit()
+        self.results_text.setReadOnly(True)
+        self.results_text.setFont(MONO)
+        self.results_text.setFixedHeight(len(_RESULT_FIELDS) * 22 + 10)
+        res_lay.addWidget(self.results_text)
 
-        log_frame = ttk.LabelFrame(main, text="Log", padding=10)
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
+        root.addWidget(res)
 
-        log_toolbar = ttk.Frame(log_frame)
-        log_toolbar.pack(fill=tk.X, pady=(0, 6))
+        # --- Log ---
+        log = QGroupBox("Log")
+        log_lay = QVBoxLayout(log)
 
-        ttk.Button(log_toolbar, text="Clear Logs", command=self._clear_logs).pack(side=tk.RIGHT)
+        log_toolbar = QHBoxLayout()
+        log_toolbar.addStretch()
+        btn_clear = QPushButton("Clear Logs")
+        btn_clear.clicked.connect(self._clear_logs)
+        log_toolbar.addWidget(btn_clear)
+        log_lay.addLayout(log_toolbar)
 
-        self.log_text = tk.Text(log_frame, height=12, wrap=tk.WORD)
-        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setFont(MONO)
+        log_lay.addWidget(self.log_text)
 
-        scrollbar = ttk.Scrollbar(log_frame, command=self.log_text.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.log_text.configure(yscrollcommand=scrollbar.set)
+        root.addWidget(log, 1)
+
+        self._clear_results()
+
+    # ── File dialogs ────────────────────────────────────────────
 
     def _pick_model(self):
-        path = filedialog.askopenfilename(
-            title="Select model",
-            filetypes=[("Model files", "*.pt *.onnx"), ("All files", "*.*")],
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select model", "",
+            "Model files (*.pt *.onnx);;All files (*)",
         )
         if path:
-            self.model_path.set(path)
+            self.model_edit.setText(path)
 
     def _pick_data(self):
-        path = filedialog.askopenfilename(
-            title="Select data.yaml",
-            filetypes=[("YAML", "*.yaml *.yml"), ("All files", "*.*")],
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select data.yaml", "",
+            "YAML (*.yaml *.yml);;All files (*)",
         )
         if path:
-            self.data_path.set(path)
+            self.data_edit.setText(path)
+
+    # ── Evaluation ──────────────────────────────────────────────
 
     def _run(self):
-        model_path = self.model_path.get().strip()
-        data_path = self.data_path.get().strip()
+        model = self.model_edit.text().strip()
+        data = self.data_edit.text().strip()
 
-        if not model_path or not os.path.isfile(model_path):
-            messagebox.showerror("Input error", "Select a valid model file.")
+        if not model or not os.path.isfile(model):
+            QMessageBox.critical(self, "Input error", "Select a valid model file.")
             return
-        if not data_path or not os.path.isfile(data_path):
-            messagebox.showerror("Input error", "Select a valid dataset yaml file.")
+        if not data or not os.path.isfile(data):
+            QMessageBox.critical(self, "Input error", "Select a valid dataset yaml file.")
             return
-
         if self._worker and self._worker.is_alive():
-            messagebox.showinfo("Busy", "Evaluation is already running.")
+            QMessageBox.information(self, "Busy", "Evaluation is already running.")
             return
 
         self._clear_results()
         self._append_log("Starting evaluation...\n")
-        self.status_text.set("Running")
-        self.progress.start(10)
-        self.run_btn.configure(state=tk.DISABLED)
+        self.status_label.setText("Running")
+        self.progress.setRange(0, 0)     # indeterminate / busy
+        self.run_btn.setEnabled(False)
 
         self._worker = threading.Thread(
             target=self._run_worker,
-            args=(model_path, data_path, self.verbose_logs.get()),
+            args=(model, data, self.verbose_cb.isChecked()),
             daemon=True,
         )
         self._worker.start()
 
-    def _run_worker(self, model_path, data_path, verbose_logs):
+    def _run_worker(self, model_path: str, data_path: str, verbose: bool):
         try:
             results = evaluate_model(
                 model_path=model_path,
                 data_path=data_path,
-                verbose_logs=verbose_logs,
+                verbose_logs=verbose,
                 log_callback=lambda msg: self._queue.put(("log", msg)),
             )
             self._queue.put(("results", results))
@@ -167,54 +198,70 @@ class App(tk.Tk):
                 if kind == "log":
                     self._append_log(payload)
                 elif kind == "results":
-                    self._apply_results(payload)
+                    self._show_results(payload)
                 elif kind == "error":
-                    self._append_log("Error: " + payload + "\n")
-                    messagebox.showerror("Evaluation failed", payload)
+                    self._append_log(f"Error: {payload}\n")
+                    QMessageBox.critical(self, "Evaluation failed", payload)
                     self._finish_run()
         except queue.Empty:
             pass
-        self.after(100, self._poll_queue)
 
-    def _apply_results(self, results):
-        def fmt(value, digits=4):
-            if value is None:
-                return "-"
-            if isinstance(value, int):
-                return str(value)
-            try:
-                return f"{value:.{digits}f}"
-            except Exception:
-                return str(value)
+    def _finish_run(self):
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self.run_btn.setEnabled(True)
+        self.status_label.setText("Idle")
 
-        self._result_vars["speed_ms"].set(fmt(results.get("speed_ms"), digits=2))
-        self._result_vars["precision"].set(fmt(results.get("precision")))
-        self._result_vars["recall"].set(fmt(results.get("recall")))
-        self._result_vars["map50"].set(fmt(results.get("map50")))
-        self._result_vars["map50_95"].set(fmt(results.get("map50_95")))
-        self._result_vars["tp"].set(fmt(results.get("tp")))
-        self._result_vars["fp"].set(fmt(results.get("fp")))
+    # ── Results helpers ─────────────────────────────────────────
 
+    @staticmethod
+    def _fmt(value, digits: int = 4) -> str:
+        if value is None:
+            return "-"
+        if isinstance(value, int) or digits == 0:
+            return str(int(value))
+        try:
+            return f"{value:.{digits}f}"
+        except (TypeError, ValueError):
+            return str(value)
+
+    def _format_results(self, results: dict) -> str:
+        lines = []
+        for label, key, digits in _RESULT_FIELDS:
+            val = self._fmt(results.get(key), digits)
+            lines.append(f"{label:<24} {val}")
+        return "\n".join(lines)
+
+    def _show_results(self, results: dict):
+        self.results_text.setPlainText(self._format_results(results))
         self._append_log("\nDone.\n")
         self._finish_run()
 
-    def _finish_run(self):
-        self.progress.stop()
-        self.run_btn.configure(state=tk.NORMAL)
-        self.status_text.set("Idle")
-
     def _clear_results(self):
-        for var in self._result_vars.values():
-            var.set("-")
+        self.results_text.setPlainText(self._format_results({}))
 
-    def _append_log(self, text):
-        self.log_text.insert(tk.END, text)
-        self.log_text.see(tk.END)
+    def _export_results(self):
+        text = self.results_text.toPlainText().strip()
+        if text:
+            QApplication.clipboard().setText(text)
+
+    # ── Log helpers ─────────────────────────────────────────────
+
+    def _append_log(self, text: str):
+        self.log_text.moveCursor(QTextCursor.MoveOperation.End)
+        self.log_text.insertPlainText(text)
+        self.log_text.moveCursor(QTextCursor.MoveOperation.End)
 
     def _clear_logs(self):
-        self.log_text.delete("1.0", tk.END)
+        self.log_text.clear()
+
+
+def main():
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    main()
